@@ -31,6 +31,7 @@ pub struct Scanner<'a> {
     pub dest_ports: Vec<u16>,
     pub src_ip: IpAddr,
     pub src_port: u16,
+    pub wait_after_send: Duration,
     pub timeout: Duration,
 }
 
@@ -70,6 +71,7 @@ impl<'a> Scanner<'a> {
             src_port: self.src_port,
             src_mac: interface.mac.ok_or(Error::NoSourceMacAddressAvailable)?,
             gateway_mac: MacAddr::from(gateway.mac_addr.octets()),
+            wait_after_send: self.wait_after_send,
             ttl: 64,
         });
         let mut results = self

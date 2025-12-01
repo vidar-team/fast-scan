@@ -178,8 +178,6 @@ impl<'a> EthernetReceiver<'a> {
             return Ok(false);
         }
 
-        debug!("{}", packet.get_source());
-
         Ok(true)
     }
 
