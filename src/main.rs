@@ -107,8 +107,11 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
     let count = dest_ips.len() * dest_ports.len();
 
     info!(
-        "start tcp syn scan, if_index: {}, src_ip: {}, dest_ips: {:?}, dest_ports: {:?}",
-        if_index, src_ip, dest_ips, dest_ports
+        "start tcp syn scan, if_index: {}, src_ip: {}, dest_ips: {:?}, number of dest_ports: {}",
+        if_index,
+        src_ip,
+        arg.dest_ips,
+        dest_ports.len()
     );
 
     let (progress, progress_tx) = Progress::new(count);
