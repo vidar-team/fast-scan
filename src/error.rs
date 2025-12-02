@@ -7,29 +7,23 @@ pub enum Error {
     #[error("network interface not found")]
     InterfaceNotFound,
 
-    #[error("failed to create data link channel: {0}")]
-    ChannelCreationFailed(#[from] std::io::Error),
-
     #[error("unsupported channel type")]
     UnsupportedChannelType,
 
     #[error("invalid packet data")]
     InvalidPacketData,
 
-    #[error("data send failed: {0}")]
-    DataSendFailed(#[from] flume::SendError<pnet::packet::ethernet::Ethernet>),
+    #[error("send progress send failed: {0}")]
+    SendProgressSendFailed(#[from] flume::SendError<(std::net::IpAddr, u16)>),
 
-    #[error("progress send failed: {0}")]
-    ProgressSendFailed(#[from] flume::SendError<(usize, std::net::IpAddr, u16)>),
+    #[error("recv progress send failed: {0}")]
+    RecvProgressSendFailed(#[from] flume::SendError<(u8, u16)>),
 
-    #[error("data recv failed: {0}")]
-    DataRecvFailed(#[from] flume::RecvError),
+    #[error("packet send failed: {0}")]
+    PacketSendFailed(#[from] flume::SendError<Vec<u8>>),
 
-    #[error("unsupported ether type: {0}")]
-    UnsupportedEtherType(pnet::packet::ethernet::EtherType),
-
-    #[error("unsupported ip next protocol: {0}")]
-    UnsupportedIpNextProtocol(pnet::packet::ip::IpNextHeaderProtocol),
+    #[error("flume recv failed: {0}")]
+    FlumeRecvFailed(#[from] flume::RecvError),
 
     #[error("insufficient buffer size")]
     InsufficientBufferSize,
@@ -44,14 +38,32 @@ pub enum Error {
     DestinationIpsExhausted,
 
     #[error("no valid source ip address")]
-    NoValidSourceIpAddress(std::net::IpAddr),
+    NoValidSourceIp(std::net::IpAddr),
 
     #[error("no source mac address available")]
-    NoSourceMacAddressAvailable,
+    NoSourceMacAvailable,
 
-    #[error("no gateway available")]
-    NoGatewayAvailable,
+    #[error("no gateway mac address available")]
+    NoGatewayMacAvailable,
+
+    #[error("no interface matched")]
+    NoInterfaceMatched,
+
+    #[error("pcap failed: {0}")]
+    PcapFailed(#[from] pcap::Error),
+
+    #[error("wait tokio failed: {0}")]
+    WaitTokioFailed(#[from] tokio::task::JoinError),
 
     #[error("timeout")]
-    Timeout(std::collections::HashMap<std::net::IpAddr, crate::scan::tcp_syn::ScanResult>),
+    Timeout(std::collections::HashMap<std::net::IpAddr, crate::scan::tcp_syn::Scanned>),
+
+    #[error("unsupported ether type: {0}")]
+    UnsupportedEtherType(pnet::packet::ethernet::EtherType),
+
+    #[error("unsupported ip next protocol: {0}")]
+    UnsupportedIpNextProtocol(pnet::packet::ip::IpNextHeaderProtocol),
+
+    #[error("invalid prefix length: {0}")]
+    InvalidPrefixLength(#[from] ipnet::PrefixLenError),
 }
