@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use fast_scan::{
     Error,
+    interface::Interface,
     scan::tcp_syn::{self},
 };
 use indicatif::ProgressBar;
@@ -14,12 +15,12 @@ use std::{net::IpAddr, time::Duration};
 use tokio::time::Instant;
 
 struct Progress {
-    progress_rx: flume::Receiver<(usize, IpAddr, u16)>,
+    progress_rx: flume::Receiver<(u8, u16)>,
     progress: ProgressBar,
 }
 
 impl Progress {
-    fn new(total: usize) -> (Self, flume::Sender<(usize, IpAddr, u16)>) {
+    fn new(total: usize) -> (Self, flume::Sender<(u8, u16)>) {
         let (progress_tx, progress_rx) = flume::unbounded();
         let progress = ProgressBar::new(total as u64);
         (
@@ -32,7 +33,7 @@ impl Progress {
     }
 
     async fn run(self) {
-        while let Ok((_index, _ip, _port)) = self.progress_rx.recv_async().await {
+        while let Ok((_flag, _port)) = self.progress_rx.recv_async().await {
             self.progress.inc(1);
         }
     }
@@ -50,33 +51,12 @@ async fn main() -> Result<()> {
 }
 
 async fn list_interfaces() -> Result<()> {
-    netdev::get_interfaces()
-        .into_iter()
-        .for_each(|interface| match interface.gateway {
-            Some(gateway) => info!(
-                "index: {}, name: {}, mac: {}, gateway_mac: {}, ipv4: {:?}, ipv6: {:?}, gateway_ipv4: {:?}, gateway_ipv6: {:?}",
-                interface.index,
-                interface.description.unwrap_or(interface.name),
-                interface.mac_addr.map_or("<unknown>".to_string(), |mac|mac.to_string()),
-                gateway.mac_addr,
-                interface.ipv4,
-                interface.ipv6,
-                gateway.ipv4,
-                gateway.ipv6,
-            ),
-            None => info!(
-                "index: {}, name: {}, mac: {}, ipv4: {:?}, ipv6: {:?}",
-                interface.index,
-                interface.description.unwrap_or(interface.name),
-                interface.mac_addr.map_or("<unknown>".to_string(), |mac|mac.to_string()),
-                interface.ipv4,
-                interface.ipv6
-            ),
-        });
+    info!("{:#?}", Interface::list()?);
     Ok(())
 }
 
 async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
+    let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
     let if_index = match arg.if_index {
         Some(if_index) => if_index,
         None => {
@@ -85,8 +65,6 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
                 .index
         }
     };
-
-    let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
 
     let src_ip = match arg.src_ip {
         Some(ip) => ip,
@@ -98,19 +76,18 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
             .ok_or(anyhow!("no default ipv4 address"))?,
     };
     let dest_ips = arg
-        .dest_ips
+        .dest_nets
         .iter()
-        .map(|ip| ip.hosts())
-        .flatten()
+        .flat_map(|ip| ip.hosts())
         .collect::<Vec<IpAddr>>();
     let dest_ports = arg.dest_ports;
     let count = dest_ips.len() * dest_ports.len();
 
     info!(
-        "start tcp syn scan, if_index: {}, src_ip: {}, dest_ips: {:?}, number of dest_ports: {}",
+        "start tcp syn scan, if_index: {}, src_ip: {}, dest_nets: {:#?}, number of dest_ports: {}",
         if_index,
         src_ip,
-        arg.dest_ips,
+        arg.dest_nets,
         dest_ports.len()
     );
 
@@ -119,26 +96,18 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
     let scanner = tcp_syn::Scanner {
         pool: &pool,
         if_index,
-        dest_ips,
+        dest_nets: arg.dest_nets,
         dest_ports,
         src_ip,
         src_port: rand::random(),
         timeout: Duration::from_secs(2),
-        wait_after_send: Some(Duration::from_nanos(1)),
-        progress_tx: Some(progress_tx),
+        send_progress_tx: None,
+        recv_progress_tx: Some(progress_tx),
     };
 
-    let start = Instant::now();
     tokio::spawn(progress.run());
-    let results = scanner.run().await;
-    let duration = Instant::now() - start;
-    info!(
-        "scan completed in {:.2} secs, {:.2} ports/sec",
-        duration.as_secs_f64(),
-        count as f64 / duration.as_secs_f64()
-    );
-
-    match results {
+    let start = Instant::now();
+    match scanner.run().await {
         Ok(results) | Err(Error::Timeout(results)) => {
             for (ip, result) in results
                 .iter()
@@ -154,5 +123,12 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
             error!("scan failed: {}", e);
         }
     }
+    let duration = Instant::now() - start;
+    info!(
+        "scan completed in {:.2} secs, {:.2} ports/sec",
+        duration.as_secs_f64(),
+        count as f64 / duration.as_secs_f64()
+    );
+
     Ok(())
 }

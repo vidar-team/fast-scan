@@ -21,7 +21,7 @@ pub struct TcpSynArg {
     pub src_ip: Option<IpAddr>,
 
     #[arg(long, required = true, value_delimiter = ',')]
-    pub dest_ips: Vec<IpNet>,
+    pub dest_nets: Vec<IpNet>,
 
     // use std::vec::Vec<u16> here
     // https://github.com/clap-rs/clap/issues/4679
