@@ -1,10 +1,22 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::net::IpAddr;
 
 #[derive(Parser)]
 pub struct Arg {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    TcpSyn(TcpSynArg),
+    ListInterfaces,
+}
+
+#[derive(Parser)]
+pub struct TcpSynArg {
     #[arg(long)]
-    pub src_ip: IpAddr,
+    pub src_ip: Option<IpAddr>,
 
     #[arg(long, required = true)]
     pub dest_ips: Vec<IpAddr>,

@@ -1,6 +1,6 @@
 mod cli;
 
-use crate::cli::Arg;
+use crate::cli::{Arg, Command, TcpSynArg};
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use fast_scan::{
@@ -10,10 +10,7 @@ use fast_scan::{
 use indicatif::ProgressBar;
 use log::{LevelFilter, error, info};
 use rayon::ThreadPoolBuilder;
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
+use std::{net::IpAddr, time::Duration};
 use tokio::time::Instant;
 
 struct Progress {
@@ -44,9 +41,43 @@ impl Progress {
 #[tokio::main]
 async fn main() -> Result<()> {
     flexi_logger::Logger::with(LevelFilter::Debug).start()?;
-    let args = Arg::try_parse()?;
+    let arg = Arg::try_parse()?;
 
-    let if_index = match args.if_index {
+    match arg.command {
+        Command::TcpSyn(arg) => tcp_syn(arg).await,
+        Command::ListInterfaces => list_interfaces().await,
+    }
+}
+
+async fn list_interfaces() -> Result<()> {
+    netdev::get_interfaces()
+        .into_iter()
+        .for_each(|interface| match interface.gateway {
+            Some(gateway) => info!(
+                "index: {}, name: {}, mac: {}, gateway_mac: {}, ipv4: {:?}, ipv6: {:?}, gateway_ipv4: {:?}, gateway_ipv6: {:?}",
+                interface.index,
+                interface.description.unwrap_or(interface.name),
+                interface.mac_addr.map_or("<unknown>".to_string(), |mac|mac.to_string()),
+                gateway.mac_addr,
+                interface.ipv4,
+                interface.ipv6,
+                gateway.ipv4,
+                gateway.ipv6,
+            ),
+            None => info!(
+                "index: {}, name: {}, mac: {}, ipv4: {:?}, ipv6: {:?}",
+                interface.index,
+                interface.description.unwrap_or(interface.name),
+                interface.mac_addr.map_or("<unknown>".to_string(), |mac|mac.to_string()),
+                interface.ipv4,
+                interface.ipv6
+            ),
+        });
+    Ok(())
+}
+
+async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
+    let if_index = match arg.if_index {
         Some(if_index) => if_index,
         None => {
             netdev::get_default_interface()
@@ -55,11 +86,25 @@ async fn main() -> Result<()> {
         }
     };
 
-    let pool = ThreadPoolBuilder::new().num_threads(args.thread).build()?;
+    let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
 
-    let dest_ips = args.dest_ips;
-    let dest_ports = args.dest_ports;
+    let src_ip = match arg.src_ip {
+        Some(ip) => ip,
+        None => netdev::get_default_interface()
+            .map_err(|e| anyhow!(e))?
+            .ip_addrs()
+            .into_iter()
+            .next()
+            .ok_or(anyhow!("no default ipv4 address"))?,
+    };
+    let dest_ips = arg.dest_ips;
+    let dest_ports = arg.dest_ports;
     let count = dest_ips.len() * dest_ports.len();
+
+    info!(
+        "start tcp syn scan, if_index: {}, src_ip: {}, dest_ips: {:?}, dest_ports: {:?}",
+        if_index, src_ip, dest_ips, dest_ports
+    );
 
     let (progress, progress_tx) = Progress::new(count);
 
@@ -68,7 +113,7 @@ async fn main() -> Result<()> {
         if_index,
         dest_ips,
         dest_ports,
-        src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 14)),
+        src_ip,
         src_port: rand::random(),
         timeout: Duration::from_secs(2),
         wait_after_send: Some(Duration::from_nanos(1)),
@@ -101,6 +146,5 @@ async fn main() -> Result<()> {
             error!("scan failed: {}", e);
         }
     }
-
     Ok(())
 }
