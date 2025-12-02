@@ -19,6 +19,9 @@ pub enum Error {
     #[error("data send failed: {0}")]
     DataSendFailed(#[from] flume::SendError<pnet::packet::ethernet::Ethernet>),
 
+    #[error("progress send failed: {0}")]
+    ProgressSendFailed(#[from] flume::SendError<(usize, std::net::IpAddr, u16)>),
+
     #[error("data recv failed: {0}")]
     DataRecvFailed(#[from] flume::RecvError),
 

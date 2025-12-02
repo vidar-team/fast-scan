@@ -16,7 +16,7 @@ use pnet::{
     },
 };
 use rayon::ThreadPool;
-use std::{net::IpAddr, time::Instant};
+use std::{net::IpAddr, sync::Arc, time::Instant};
 
 #[derive(Clone)]
 pub struct Filter {
@@ -33,7 +33,7 @@ pub struct EthernetReceiver<'a> {
     rx: Box<dyn DataLinkReceiver + 'static>,
     pool: &'a ThreadPool,
     data_tx: flume::Sender<Ethernet>,
-    filter: Filter,
+    filter: Arc<Filter>,
 }
 
 impl<'a> EthernetReceiver<'a> {
@@ -47,7 +47,7 @@ impl<'a> EthernetReceiver<'a> {
             rx,
             pool,
             data_tx,
-            filter: filter.clone(),
+            filter: Arc::new(filter.clone()),
         }
     }
 
@@ -57,40 +57,45 @@ impl<'a> EthernetReceiver<'a> {
             while let Ok(raw) = self.rx.next()
                 && !self.data_tx.is_disconnected()
             {
-                if let Err(e) = Self::handle_raw(raw, self.data_tx.clone(), &self.filter) {
-                    error!("failed to handle raw packet: {}", e);
-                }
+                let raw = raw.to_vec();
+                let filter = self.filter.clone();
+                let data_tx = self.data_tx.clone();
+                rayon::spawn(move || {
+                    if let Err(e) = Self::filter_ethernet(raw, data_tx, &filter) {
+                        error!("failed to handle raw packet: {}", e);
+                    }
+                });
             }
             debug!("ethernet receiver stopped");
         });
     }
 
-    fn handle_raw(raw: &[u8], data_tx: flume::Sender<Ethernet>, filter: &Filter) -> Result<bool> {
-        let packet = EthernetPacket::new(raw).ok_or(Error::InvalidPacketData)?;
-
-        if !Self::filter_ethernet(&packet, filter)? {
-            return Ok(false);
-        }
-
-        data_tx
-            .send(packet.from_packet())
-            .map_err(|e| Error::DataSendFailed(e))?;
-        Ok(true)
-    }
-
-    fn filter_ethernet(packet: &EthernetPacket<'_>, filter: &Filter) -> Result<bool> {
+    fn filter_ethernet(
+        packet: Vec<u8>,
+        data_tx: flume::Sender<Ethernet>,
+        filter: &Filter,
+    ) -> Result<bool> {
+        let packet = EthernetPacket::new(&packet).ok_or(Error::InvalidPacketData)?;
         let ether_type = packet.get_ethertype();
 
         if !Self::filter_ether_type(&ether_type, filter) {
             return Ok(false);
         }
 
-        match ether_type {
-            EtherTypes::Arp => Self::filter_arp(packet, filter),
-            EtherTypes::Ipv4 => Self::filter_ipv4(packet, filter),
-            EtherTypes::Ipv6 => Self::filter_ipv6(packet, filter),
+        if !match ether_type {
+            EtherTypes::Arp => Self::filter_arp(&packet, filter),
+            EtherTypes::Ipv4 => Self::filter_ipv4(&packet, filter),
+            EtherTypes::Ipv6 => Self::filter_ipv6(&packet, filter),
             other => Err(Error::UnsupportedEtherType(other)),
+        }? {
+            return Ok(false);
         }
+
+        data_tx
+            .send(packet.from_packet())
+            .map_err(|e| Error::DataSendFailed(e))?;
+
+        Ok(true)
     }
 
     fn filter_arp(packet: &EthernetPacket<'_>, filter: &Filter) -> Result<bool> {

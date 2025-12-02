@@ -16,6 +16,10 @@ use pnet::{
 use rayon::ThreadPool;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{self, Duration},
 };
@@ -31,7 +35,7 @@ pub struct TcpSyn {
     pub src_port: u16,
     pub src_mac: MacAddr,
     pub gateway_mac: MacAddr,
-    pub wait_after_send: Duration,
+    pub wait_after_send: Option<Duration>,
     pub ttl: u8,
 }
 
@@ -40,12 +44,15 @@ pub struct EthernetSender<'a> {
     pool: &'a ThreadPool,
     scan_config: SendConfig,
     counter: usize,
+    progress_tx: Option<flume::Sender<(usize, IpAddr, u16)>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl<'a> EthernetSender<'a> {
     pub fn new(
         pool: &'a ThreadPool,
         tx: Box<dyn DataLinkSender + 'static>,
+        progress_tx: Option<flume::Sender<(usize, IpAddr, u16)>>,
         scan_config: SendConfig,
     ) -> Result<Self> {
         if let Some(e) = match &scan_config {
@@ -67,24 +74,35 @@ impl<'a> EthernetSender<'a> {
             tx,
             pool,
             scan_config,
+            progress_tx,
             counter: 0,
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub fn spawn(mut self) {
+    pub fn spawn(mut self) -> Arc<AtomicBool> {
+        let stopped = self.stopped.clone();
         self.pool.spawn(move || {
             debug!("ethernet sender started");
-            if let Err(e) = Self::send(self.tx, &mut self.scan_config, &mut self.counter) {
+            if let Err(e) = Self::send(
+                self.tx,
+                &mut self.scan_config,
+                &mut self.counter,
+                self.progress_tx,
+            ) {
                 error!("failed to send packet: {}", e);
             }
+            self.stopped.store(true, Ordering::Relaxed);
             debug!("ethernet sender stopped");
         });
+        stopped
     }
 
     fn send(
         mut tx: Box<dyn DataLinkSender + 'static>,
         scan_config: &mut SendConfig,
         counter: &mut usize,
+        progress_tx: Option<flume::Sender<(usize, IpAddr, u16)>>,
     ) -> Result<()> {
         let (num_packets, packet_size, wait_after_send, mut func) = match scan_config {
             SendConfig::TcpSyn(config) => (
@@ -92,14 +110,18 @@ impl<'a> EthernetSender<'a> {
                 Self::tcp_syn_packet_size(config),
                 config.wait_after_send,
                 move |buffer: &mut [u8]| {
-                    if let Err(e) = Self::build_tcp_syn_packet(buffer, config, counter) {
+                    if let Err(e) =
+                        Self::build_tcp_syn_packet(buffer, config, counter, progress_tx.clone())
+                    {
                         error!("failed to build tcp syn packet: {}", e);
                     }
                 },
             ),
         };
         for _ in 0..num_packets {
-            thread::sleep(wait_after_send);
+            if let Some(wait_after_send) = wait_after_send {
+                thread::sleep(wait_after_send);
+            }
             tx.build_and_send(1, packet_size, &mut func)
                 .ok_or(Error::InsufficientBufferSize)??;
         }
@@ -110,6 +132,7 @@ impl<'a> EthernetSender<'a> {
         buffer: &mut [u8],
         config: &mut TcpSyn,
         counter: &mut usize,
+        progress_tx: Option<flume::Sender<(usize, IpAddr, u16)>>,
     ) -> Result<()> {
         let (port_index, ip_index) = counter.div_rem(&config.dest_ips.len());
         *counter += 1;
@@ -121,6 +144,12 @@ impl<'a> EthernetSender<'a> {
             .dest_ports
             .get(port_index)
             .ok_or(Error::DestinationPortsExhausted)?;
+
+        if let Some(progress_tx) = progress_tx {
+            progress_tx
+                .send((*counter, dest_ip, dest_port))
+                .map_err(|e| Error::ProgressSendFailed(e))?;
+        }
 
         Self::build_ethernet(
             &mut buffer[..14],

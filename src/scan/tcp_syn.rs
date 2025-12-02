@@ -18,7 +18,7 @@ use pnet::{
     util::MacAddr,
 };
 use rayon::ThreadPool;
-use std::{collections::HashMap, net::IpAddr, time::Duration};
+use std::{collections::HashMap, net::IpAddr, sync::atomic::Ordering, time::Duration};
 use tokio::{select, time};
 
 const CLOSED: u8 = TcpFlags::ACK | TcpFlags::RST;
@@ -31,8 +31,9 @@ pub struct Scanner<'a> {
     pub dest_ports: Vec<u16>,
     pub src_ip: IpAddr,
     pub src_port: u16,
-    pub wait_after_send: Duration,
     pub timeout: Duration,
+    pub wait_after_send: Option<Duration>,
+    pub progress_tx: Option<flume::Sender<(usize, IpAddr, u16)>>,
 }
 
 #[derive(Debug)]
@@ -94,7 +95,8 @@ impl<'a> Scanner<'a> {
         {
             Channel::Ethernet(tx, rx) => {
                 EthernetReceiver::new(&self.pool, rx, data_tx, &filter).spawn();
-                EthernetSender::new(&self.pool, tx, config)?.spawn();
+                let sender_stopped =
+                    EthernetSender::new(&self.pool, tx, self.progress_tx.clone(), config)?.spawn();
 
                 loop {
                     select! {
@@ -106,7 +108,7 @@ impl<'a> Scanner<'a> {
                                 break Ok(results);
                             }
                         }
-                        _ = time::sleep(self.timeout) => break Err(Error::Timeout(results)),
+                        _ = time::sleep(self.timeout), if sender_stopped.load(Ordering::Relaxed) => break Err(Error::Timeout(results)),
                     }
                 }
             }
