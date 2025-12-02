@@ -1,0 +1,32 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        
+    - name: Build
+      shell: pwsh
+      run: |
+        cargo build -r
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: fast-scan-windows
+        path: |
+          ./target/release/fast-scan.exe

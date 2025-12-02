@@ -1,4 +1,8 @@
 [target.'cfg(all(target_os="windows", target_arch="x86_64"))']
 rustflags = [
-    "-L", "lib",
+    "-L", "lib/x64",
+]
+[target.'cfg(all(target_os="windows", target_arch="x86"))']
+rustflags = [
+    "-L", "lib/x86",
 ]
