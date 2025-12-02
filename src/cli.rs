@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use ipnet::IpNet;
 use std::net::IpAddr;
 
 #[derive(Parser)]
@@ -18,10 +19,10 @@ pub struct TcpSynArg {
     #[arg(long)]
     pub src_ip: Option<IpAddr>,
 
-    #[arg(long, required = true)]
-    pub dest_ips: Vec<IpAddr>,
+    #[arg(long, required = true, value_delimiter = ',')]
+    pub dest_ips: Vec<IpNet>,
 
-    #[arg(long, required = true)]
+    #[arg(long, required = true, value_delimiter = ',')]
     pub dest_ports: Vec<u16>,
 
     #[arg(short, long)]

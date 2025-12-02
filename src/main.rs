@@ -97,7 +97,12 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
             .next()
             .ok_or(anyhow!("no default ipv4 address"))?,
     };
-    let dest_ips = arg.dest_ips;
+    let dest_ips = arg
+        .dest_ips
+        .iter()
+        .map(|ip| ip.hosts())
+        .flatten()
+        .collect::<Vec<IpAddr>>();
     let dest_ports = arg.dest_ports;
     let count = dest_ips.len() * dest_ports.len();
 
