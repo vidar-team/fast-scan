@@ -108,7 +108,9 @@ impl<'a> Scanner<'a> {
                                 break Ok(results);
                             }
                         }
-                        _ = time::sleep(self.timeout), if sender_stopped.load(Ordering::Relaxed) => break Err(Error::Timeout(results)),
+                        _ = time::sleep(self.timeout) => if sender_stopped.load(Ordering::Relaxed) {
+                            break Err(Error::Timeout(results));
+                        }
                     }
                 }
             }
