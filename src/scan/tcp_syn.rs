@@ -72,7 +72,7 @@ impl<'a> Scanner<'a> {
             .join(" or ");
 
         Ok(format!(
-            "{} and dst host {} and dst port {} and tcp[tcpflags] & tcp-ack != 0",
+            r"({}) and dst host {} and dst port {} and (tcp[tcpflags] & (tcp-ack | tcp-syn) != 0 or tcp[tcpflags] & (tcp-ack | tcp-rst) != 0)",
             dest_nets_filter, self.src_ip, self.src_port
         ))
     }
