@@ -3,7 +3,6 @@ use crate::{
     receiver::{EthernetReceiver, Filter},
     sender::{EthernetSender, SendConfig, TcpSyn},
 };
-use log::debug;
 use netdev::interface;
 use pnet::{
     datalink::{self, Channel, Config as DataLinkConfig},

@@ -6,8 +6,6 @@ use pnet::{
         FromPacket, Packet,
         arp::ArpPacket,
         ethernet::{EtherType, EtherTypes, Ethernet, EthernetPacket},
-        icmp::IcmpPacket,
-        icmpv6::Icmpv6Packet,
         ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
         ipv4::Ipv4Packet,
         ipv6::Ipv6Packet,
@@ -16,7 +14,7 @@ use pnet::{
     },
 };
 use rayon::ThreadPool;
-use std::{net::IpAddr, sync::Arc, time::Instant};
+use std::{net::IpAddr, sync::Arc};
 
 #[derive(Clone)]
 pub struct Filter {

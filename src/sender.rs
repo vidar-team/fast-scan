@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{self, Duration},
+    time::Duration,
 };
 
 pub enum SendConfig {

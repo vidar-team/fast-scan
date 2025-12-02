@@ -1,20 +1,20 @@
+mod cli;
+
+use crate::cli::Arg;
 use anyhow::{Result, anyhow};
+use clap::Parser;
 use fast_scan::{
     Error,
-    scan::tcp_syn::{self, ScanResult},
+    scan::tcp_syn::{self},
 };
 use indicatif::ProgressBar;
-use ipnet::{IpNet, Ipv4Net};
-use log::{LevelFilter, error, info, warn};
+use log::{LevelFilter, error, info};
 use rayon::ThreadPoolBuilder;
 use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
-use tokio::{
-    task::{JoinHandle, JoinSet},
-    time::Instant,
-};
+use tokio::time::Instant;
 
 struct Progress {
     progress_rx: flume::Receiver<(usize, IpAddr, u16)>,
@@ -44,22 +44,25 @@ impl Progress {
 #[tokio::main]
 async fn main() -> Result<()> {
     flexi_logger::Logger::with(LevelFilter::Debug).start()?;
+    let args = Arg::try_parse()?;
 
-    let pool = ThreadPoolBuilder::new().num_threads(10).build()?;
-    let interface = netdev::get_default_interface().map_err(|e| anyhow!(e))?;
-    info!(
-        "using interface: {} ({})",
-        interface.name,
-        interface.friendly_name.unwrap_or("<unknown>".to_string())
-    );
-    let if_index = interface.index;
-    let dest_ips = Ipv4Net::new(Ipv4Addr::new(172, 16, 0, 0), 16)?
-        .hosts()
-        .map(IpAddr::V4)
-        .collect::<Vec<_>>();
-    let dest_ports = (7880..=7900).collect::<Vec<_>>();
+    let if_index = match args.if_index {
+        Some(if_index) => if_index,
+        None => {
+            netdev::get_default_interface()
+                .map_err(|e| anyhow!(e))?
+                .index
+        }
+    };
+
+    let pool = ThreadPoolBuilder::new().num_threads(args.thread).build()?;
+
+    let dest_ips = args.dest_ips;
+    let dest_ports = args.dest_ports;
     let count = dest_ips.len() * dest_ports.len();
+
     let (progress, progress_tx) = Progress::new(count);
+
     let scanner = tcp_syn::Scanner {
         pool: &pool,
         if_index,
