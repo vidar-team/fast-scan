@@ -60,11 +60,7 @@ impl<'a> Worker<'a> {
             return;
         }
 
-        let last = Self::set_changed_on(state_changed_on, time);
-        debug!(
-            "worker state changed to {:?}, last changed on {} ms",
-            new, last
-        );
+        Self::set_changed_on(state_changed_on, time);
         state.swap(new, Ordering::Release);
     }
 

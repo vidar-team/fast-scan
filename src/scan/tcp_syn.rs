@@ -136,14 +136,18 @@ impl<'a> Scanner<'a> {
         }
 
         self.pool.spawn(move || {
+            debug!("sender started");
             if let Err(e) = Self::send(send_tx, sender) {
                 error!("failed to send packet data: {}", e)
             }
+            debug!("sender stopped");
         });
         self.pool.spawn(move || {
+            debug!("receiver started");
             if let Err(e) = Self::recv(recv_rx, receiver) {
                 error!("failed to recv packet data: {}", e)
             }
+            debug!("receiver stopped");
         });
         result_rx
             .into_recv_async()
