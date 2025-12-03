@@ -56,19 +56,22 @@ impl<'a> Worker<'a> {
         state_changed_on: Arc<AtomicU64>,
         time: Instant,
     ) {
-        if state.swap(new, Ordering::Relaxed) != new {
-            let last = Self::set_changed_on(state_changed_on, time);
-            debug!(
-                "worker state changed to {:?}, last changed on {}",
-                new, last
-            );
+        if state.load(Ordering::Acquire) == new {
+            return;
         }
+
+        let last = Self::set_changed_on(state_changed_on, time);
+        debug!(
+            "worker state changed to {:?}, last changed on {} ms",
+            new, last
+        );
+        state.swap(new, Ordering::Release);
     }
 
     fn set_changed_on(state_changed_on: Arc<AtomicU64>, time: Instant) -> u64 {
         state_changed_on.swap(
             Instant::now().duration_since(time).as_millis() as u64,
-            Ordering::Relaxed,
+            Ordering::SeqCst,
         )
     }
 

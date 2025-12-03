@@ -41,6 +41,7 @@ pub struct Scanner<'a> {
     pub src_ip: IpAddr,
     pub src_port: u16,
     pub timeout: Duration,
+    pub send_buffer_size: usize,
     pub recv_progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
     pub send_progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
@@ -97,7 +98,7 @@ impl<'a> Scanner<'a> {
 
     pub async fn run(&self) -> Result<HashMap<IpAddr, Scanned>> {
         let interface = Interface::by_index(self.if_index)?;
-        let (send_tx, send_rx) = flume::unbounded::<Vec<u8>>();
+        let (send_tx, send_rx) = flume::bounded::<Vec<u8>>(self.send_buffer_size);
         let (recv_tx, recv_rx) = flume::unbounded::<Vec<u8>>();
         let (result_tx, result_rx) = flume::unbounded::<Result<HashMap<IpAddr, Scanned>>>();
         let bpf = self.build_bpf()?;
@@ -326,10 +327,9 @@ impl<'a> Scanner<'a> {
                         State::Idle => {
                             if Duration::from_millis(
                                 Instant::now().duration_since(receiver.time).as_millis() as u64
-                                    - receiver.state_changed_on.load(Ordering::Relaxed),
+                                    - receiver.state_changed_on.load(Ordering::Acquire),
                             ) >= receiver.timeout
                             {
-                                debug!("receiver timeout reached");
                                 break Err(Error::Timeout(lock.clone()));
                             }
                         }

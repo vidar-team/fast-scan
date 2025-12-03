@@ -110,6 +110,7 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
         src_ip,
         src_port: rand::random(),
         timeout: Duration::from_secs(2),
+        send_buffer_size: arg.send_buffer_size,
         send_progress_tx: None,
         recv_progress_tx: Some(progress_tx),
     };
