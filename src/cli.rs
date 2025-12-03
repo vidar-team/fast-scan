@@ -36,6 +36,9 @@ pub struct TcpSynArg {
 
     #[arg(short, long, default_value_t = 30000)]
     pub send_buffer_size: usize,
+
+    #[arg(short, long, default_value_t = false)]
+    pub wait_idle: bool,
 }
 
 fn parse_range(s: &str) -> Result<Vec<u16>> {

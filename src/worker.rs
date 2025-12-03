@@ -61,7 +61,7 @@ impl<'a> Worker<'a> {
         }
 
         Self::set_changed_on(state_changed_on, time);
-        state.swap(new, Ordering::Release);
+        state.swap(new, Ordering::SeqCst);
     }
 
     fn set_changed_on(state_changed_on: Arc<AtomicU64>, time: Instant) -> u64 {
@@ -93,7 +93,7 @@ impl<'a> Worker<'a> {
                             self.time,
                         );
                         if let Err(e) = tx.send(packet.data.to_vec()) {
-                            error!("failed to send packet data: {}", e);
+                            error!("failed to send packet data from capture: {}", e);
                             break;
                         }
                     }
@@ -119,7 +119,7 @@ impl<'a> Worker<'a> {
                         ),
                     },
                     Err(e) => {
-                        error!("failed to capture packet: {}", e);
+                        error!("failed to recv packet: {}", e);
                         break;
                     }
                 }

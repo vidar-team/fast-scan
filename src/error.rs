@@ -46,8 +46,20 @@ pub enum Error {
     #[error("pcap failed: {0}")]
     PcapFailed(#[from] pcap::Error),
 
+    #[error("all destination ports exhausted")]
+    DestinationPortsExhausted,
+
+    #[error("all destination ips exhausted")]
+    DestinationIpsExhausted,
+
     #[error("timeout")]
     Timeout(std::collections::HashMap<std::net::IpAddr, crate::scan::tcp_syn::Scanned>),
+
+    #[error("worker aborted")]
+    WorkerAbortedWith(std::collections::HashMap<std::net::IpAddr, crate::scan::tcp_syn::Scanned>),
+
+    #[error("worker aborted")]
+    WorkerAborted,
 
     #[error("unsupported ether type: {0}")]
     UnsupportedEtherType(pnet::packet::ethernet::EtherType),

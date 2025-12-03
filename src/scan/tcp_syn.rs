@@ -6,6 +6,7 @@ use crate::{
 use flume::TryRecvError;
 use ipnet::IpNet;
 use log::{debug, error};
+use num_integer::Integer;
 use pnet::{
     packet::{
         FromPacket, Packet,
@@ -42,6 +43,7 @@ pub struct Scanner<'a> {
     pub src_port: u16,
     pub timeout: Duration,
     pub send_buffer_size: usize,
+    pub wait_idle: bool,
     pub recv_progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
     pub send_progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
@@ -61,6 +63,8 @@ struct Sender {
     src_mac: MacAddr,
     gateway_mac: MacAddr,
     ttl: u8,
+    state: Arc<AtomicState>,
+    wait_idle: bool,
     progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
 
@@ -118,6 +122,8 @@ impl<'a> Scanner<'a> {
             src_mac: MacAddr::from(interface.mac.ok_or(Error::NoSourceMacAvailable)?),
             gateway_mac: MacAddr::from(interface.gateway_mac.ok_or(Error::NoGatewayMacAvailable)?),
             ttl: 64,
+            state: state.clone(),
+            wait_idle: self.wait_idle,
             progress_tx: self.send_progress_tx.clone(),
         };
         let receiver = Receiver {
@@ -138,14 +144,14 @@ impl<'a> Scanner<'a> {
         self.pool.spawn(move || {
             debug!("sender started");
             if let Err(e) = Self::send(send_tx, sender) {
-                error!("failed to send packet data: {}", e)
+                error!("failed to send packet data to capture: {}", e)
             }
             debug!("sender stopped");
         });
         self.pool.spawn(move || {
             debug!("receiver started");
             if let Err(e) = Self::recv(recv_rx, receiver) {
-                error!("failed to recv packet data: {}", e)
+                error!("recv task failed: {}", e)
             }
             debug!("receiver stopped");
         });
@@ -157,53 +163,79 @@ impl<'a> Scanner<'a> {
 
     fn send(send_tx: flume::Sender<Vec<u8>>, sender: Sender) -> Result<()> {
         let mut buffer = vec![0u8; Self::tcp_syn_packet_size(&sender)];
-        for dest_port in sender.dest_ports {
-            for dest_ip in &sender.dest_ips {
-                if let Some(ref progress_tx) = sender.progress_tx {
-                    progress_tx.send((*dest_ip, dest_port))?;
-                }
+        let mut index = 0usize;
+        let total = sender.dest_ips.len() * sender.dest_ports.len();
 
-                Self::build_ethernet(
-                    &mut buffer[..14],
-                    sender.src_mac,
-                    sender.gateway_mac,
-                    match sender.src_ip {
-                        IpAddr::V4(_) => EtherTypes::Ipv4,
-                        IpAddr::V6(_) => EtherTypes::Ipv6,
-                    },
-                )?;
-                let tcp_size = Self::build_tcp(
-                    &mut buffer[match sender.src_ip {
-                        IpAddr::V4(_) => 34,
-                        IpAddr::V6(_) => 54,
-                    }..],
-                    sender.src_ip,
-                    *dest_ip,
-                    sender.src_port,
-                    dest_port,
-                )?;
-                match (sender.src_ip, dest_ip) {
-                    (IpAddr::V4(src_ip), IpAddr::V4(dest_ip)) => Self::build_ipv4(
-                        &mut buffer[14..34],
-                        src_ip,
-                        *dest_ip,
-                        (20 + tcp_size) as u16,
-                        sender.ttl,
-                    ),
-                    (IpAddr::V4(_), IpAddr::V6(_)) => return Err(Error::IpVersionMismatch),
-                    (IpAddr::V6(_), IpAddr::V4(_)) => return Err(Error::IpVersionMismatch),
-                    (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
-                        &mut buffer[14..54],
-                        src_ip,
-                        *dest_ip,
-                        tcp_size as u16,
-                        sender.ttl,
-                    ),
-                }?;
-                send_tx.send(buffer.clone())?;
-            }
+        // wait until receiver is started
+        while sender.state.load(Ordering::Acquire) == State::Stopped {
+            rayon::yield_now();
         }
-        Ok(())
+
+        loop {
+            if index >= total {
+                break Ok(());
+            }
+
+            match sender.state.load(Ordering::Acquire) {
+                State::Stopped => break Err(Error::WorkerAborted),
+                State::Busy if sender.wait_idle => continue,
+                _ => {}
+            }
+
+            let (port_index, ip_index) = index.div_rem(&sender.dest_ips.len());
+            index += 1;
+            let dest_ip = *sender
+                .dest_ips
+                .get(ip_index)
+                .ok_or(Error::DestinationIpsExhausted)?;
+            let dest_port = *sender
+                .dest_ports
+                .get(port_index)
+                .ok_or(Error::DestinationPortsExhausted)?;
+
+            if let Some(ref progress_tx) = sender.progress_tx {
+                let _ = progress_tx.send((dest_ip, dest_port));
+            }
+
+            Self::build_ethernet(
+                &mut buffer[..14],
+                sender.src_mac,
+                sender.gateway_mac,
+                match sender.src_ip {
+                    IpAddr::V4(_) => EtherTypes::Ipv4,
+                    IpAddr::V6(_) => EtherTypes::Ipv6,
+                },
+            )?;
+            let tcp_size = Self::build_tcp(
+                &mut buffer[match sender.src_ip {
+                    IpAddr::V4(_) => 34,
+                    IpAddr::V6(_) => 54,
+                }..],
+                sender.src_ip,
+                dest_ip,
+                sender.src_port,
+                dest_port,
+            )?;
+            match (sender.src_ip, dest_ip) {
+                (IpAddr::V4(src_ip), IpAddr::V4(dest_ip)) => Self::build_ipv4(
+                    &mut buffer[14..34],
+                    src_ip,
+                    dest_ip,
+                    (20 + tcp_size) as u16,
+                    sender.ttl,
+                ),
+                (IpAddr::V4(_), IpAddr::V6(_)) => return Err(Error::IpVersionMismatch),
+                (IpAddr::V6(_), IpAddr::V4(_)) => return Err(Error::IpVersionMismatch),
+                (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
+                    &mut buffer[14..54],
+                    src_ip,
+                    dest_ip,
+                    tcp_size as u16,
+                    sender.ttl,
+                ),
+            }?;
+            send_tx.send(buffer.clone())?;
+        }
     }
 
     fn build_ethernet(
@@ -322,7 +354,7 @@ impl<'a> Scanner<'a> {
         let progress_tx = receiver.progress_tx.clone();
 
         // wait until receiver is started
-        while receiver.state.load(Ordering::Relaxed) == State::Stopped {
+        while receiver.state.load(Ordering::Acquire) == State::Stopped {
             rayon::yield_now();
         }
 
@@ -333,8 +365,8 @@ impl<'a> Scanner<'a> {
                         break Ok(lock.clone());
                     }
 
-                    match receiver.state.load(Ordering::Relaxed) {
-                        State::Idle | State::Stopped => {
+                    match receiver.state.load(Ordering::Acquire) {
+                        State::Idle => {
                             if Duration::from_millis(
                                 Instant::now().duration_since(receiver.time).as_millis() as u64
                                     - receiver.state_changed_on.load(Ordering::Acquire),
@@ -344,6 +376,7 @@ impl<'a> Scanner<'a> {
                             }
                         }
                         State::Busy => {}
+                        State::Stopped => break Err(Error::WorkerAbortedWith(lock.clone())),
                     }
                 }
                 Err(_) => break Err(Error::RwLockPoisoned),
@@ -359,17 +392,14 @@ impl<'a> Scanner<'a> {
                         rayon::spawn(move || {
                             match (Self::parse_ethernet(packet, result.clone()), progress_tx) {
                                 (Ok(Some((dest_ip, flags, port))), Some(progress_tx)) => {
-                                    if let Err(e) = progress_tx.send((dest_ip, flags, port)) {
-                                        error!("failed to send progress: {}", e);
-                                    }
+                                    let _ = progress_tx.send((dest_ip, flags, port));
                                 }
                                 (Err(e), _) => error!("failed to parse packet: {}", e),
                                 _ => {}
                             }
                         })
                     }),
-                Err(TryRecvError::Empty) => {}
-                Err(e) => break Err(Error::from(e)),
+                _ => {}
             }
         };
 

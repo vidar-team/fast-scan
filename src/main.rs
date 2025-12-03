@@ -9,7 +9,7 @@ use fast_scan::{
     scan::tcp_syn::{self},
 };
 use indicatif::ProgressBar;
-use log::{LevelFilter, error, info};
+use log::{LevelFilter, error, info, warn};
 use rayon::ThreadPoolBuilder;
 use std::{net::IpAddr, time::Duration};
 use tokio::time::Instant;
@@ -110,6 +110,7 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
         src_ip,
         src_port: rand::random(),
         timeout: Duration::from_secs(2),
+        wait_idle: arg.wait_idle,
         send_buffer_size: arg.send_buffer_size,
         send_progress_tx: None,
         recv_progress_tx: Some(progress_tx),
@@ -118,7 +119,31 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
     tokio::spawn(progress.run());
     let start = Instant::now();
     match scanner.run().await {
-        Ok(results) | Err(Error::Timeout(results)) => {
+        Ok(results) => {
+            for (ip, result) in results
+                .iter()
+                .filter(|(_, result)| !result.opened.is_empty())
+            {
+                info!(
+                    "{}: opened: {:?}, unknown: {:?}",
+                    ip, result.opened, result.unknown
+                );
+            }
+        }
+        Err(Error::Timeout(results)) => {
+            warn!("scan timed out");
+            for (ip, result) in results
+                .iter()
+                .filter(|(_, result)| !result.opened.is_empty())
+            {
+                info!(
+                    "{}: opened: {:?}, unknown: {:?}",
+                    ip, result.opened, result.unknown
+                );
+            }
+        }
+        Err(Error::WorkerAbortedWith(results)) => {
+            warn!("worker aborted");
             for (ip, result) in results
                 .iter()
                 .filter(|(_, result)| !result.opened.is_empty())
