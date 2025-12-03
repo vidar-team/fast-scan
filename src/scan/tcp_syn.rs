@@ -316,6 +316,12 @@ impl<'a> Scanner<'a> {
                 .collect::<HashMap<_, _>>(),
         ));
         let progress_tx = receiver.progress_tx.clone();
+
+        // wait until receiver is started
+        while receiver.state.load(Ordering::Relaxed) == State::Stopped {
+            rayon::yield_now();
+        }
+
         let emit = loop {
             match result.read() {
                 Ok(lock) => {
@@ -324,7 +330,7 @@ impl<'a> Scanner<'a> {
                     }
 
                     match receiver.state.load(Ordering::Relaxed) {
-                        State::Idle => {
+                        State::Idle | State::Stopped => {
                             if Duration::from_millis(
                                 Instant::now().duration_since(receiver.time).as_millis() as u64
                                     - receiver.state_changed_on.load(Ordering::Acquire),
@@ -334,7 +340,6 @@ impl<'a> Scanner<'a> {
                             }
                         }
                         State::Busy => {}
-                        State::Stopped => continue,
                     }
                 }
                 Err(_) => break Err(Error::RwLockPoisoned),
