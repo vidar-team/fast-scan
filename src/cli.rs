@@ -28,10 +28,10 @@ pub struct TcpSynArg {
     #[arg(long, required = true, value_parser = parse_range)]
     pub dest_ports: std::vec::Vec<u16>,
 
-    #[arg(short, long)]
-    pub if_index: Option<u32>,
+    #[arg(short, long, default_value_t = default_if_index())]
+    pub if_index: u32,
 
-    #[arg(short, long, default_value_t = 5)]
+    #[arg(short, long, default_value_t = 12)]
     pub thread: usize,
 }
 
@@ -54,4 +54,10 @@ fn parse_range(s: &str) -> Result<Vec<u16>> {
     }
 
     Ok(result.into_iter().collect())
+}
+
+fn default_if_index() -> u32 {
+    netdev::get_default_interface()
+        .expect("no default interface provided")
+        .index
 }

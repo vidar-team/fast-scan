@@ -1,7 +1,7 @@
 mod cli;
 
 use crate::cli::{Arg, Command, TcpSynArg};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use fast_scan::{
     Error,
@@ -14,13 +14,13 @@ use rayon::ThreadPoolBuilder;
 use std::{net::IpAddr, time::Duration};
 use tokio::time::Instant;
 
-struct Progress {
-    progress_rx: flume::Receiver<(u8, u16)>,
+struct Progress<T> {
+    progress_rx: flume::Receiver<T>,
     progress: ProgressBar,
 }
 
-impl Progress {
-    fn new(total: usize) -> (Self, flume::Sender<(u8, u16)>) {
+impl<T> Progress<T> {
+    fn new(total: usize) -> (Self, flume::Sender<T>) {
         let (progress_tx, progress_rx) = flume::unbounded();
         let progress = ProgressBar::new(total as u64);
         (
@@ -33,7 +33,7 @@ impl Progress {
     }
 
     async fn run(self) {
-        while let Ok((_flag, _port)) = self.progress_rx.recv_async().await {
+        while self.progress_rx.recv_async().await.is_ok() {
             self.progress.inc(1);
         }
     }
@@ -50,6 +50,15 @@ async fn main() -> Result<()> {
     }
 }
 
+fn ip_version_match(a: &IpAddr, b: &IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => true,
+        (IpAddr::V4(_), IpAddr::V6(_)) => false,
+        (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        (IpAddr::V6(_), IpAddr::V6(_)) => true,
+    }
+}
+
 async fn list_interfaces() -> Result<()> {
     info!("{:#?}", Interface::list()?);
     Ok(())
@@ -57,47 +66,47 @@ async fn list_interfaces() -> Result<()> {
 
 async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
     let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
-    let if_index = match arg.if_index {
-        Some(if_index) => if_index,
-        None => {
-            netdev::get_default_interface()
-                .map_err(|e| anyhow!(e))?
-                .index
-        }
-    };
 
+    let dest_ips = arg
+        .dest_nets
+        .iter()
+        .flat_map(|ip| ip.hosts())
+        .collect::<Vec<IpAddr>>();
+    // SAFETY: dest_ips is non-empty because dest_nets is required
+    let first_dest_ip = dest_ips.first().unwrap();
+    if dest_ips
+        .iter()
+        .any(|ip| !ip_version_match(ip, first_dest_ip))
+    {
+        bail!("mixed ipv4 and ipv6 addresses are not supported");
+    }
     let src_ip = match arg.src_ip {
         Some(ip) => ip,
         None => netdev::get_default_interface()
             .map_err(|e| anyhow!(e))?
             .ip_addrs()
             .into_iter()
-            .next()
-            .ok_or(anyhow!("no default ipv4 address"))?,
+            .find(|ip| ip_version_match(ip, first_dest_ip))
+            .ok_or(anyhow!("no default address"))?,
     };
-    let dest_ips = arg
-        .dest_nets
-        .iter()
-        .flat_map(|ip| ip.hosts())
-        .collect::<Vec<IpAddr>>();
-    let dest_ports = arg.dest_ports;
-    let count = dest_ips.len() * dest_ports.len();
+
+    let count = dest_ips.len() * arg.dest_ports.len();
 
     info!(
         "start tcp syn scan, if_index: {}, src_ip: {}, dest_nets: {:#?}, number of dest_ports: {}",
-        if_index,
+        arg.if_index,
         src_ip,
         arg.dest_nets,
-        dest_ports.len()
+        arg.dest_ports.len()
     );
 
     let (progress, progress_tx) = Progress::new(count);
 
     let scanner = tcp_syn::Scanner {
         pool: &pool,
-        if_index,
+        if_index: arg.if_index,
         dest_nets: arg.dest_nets,
-        dest_ports,
+        dest_ports: arg.dest_ports,
         src_ip,
         src_port: rand::random(),
         timeout: Duration::from_secs(2),

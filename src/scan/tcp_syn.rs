@@ -1,17 +1,18 @@
 use crate::{
     error::{Error, Result},
     interface::Interface,
-    worker::{State, Worker},
+    worker::{AtomicState, State, Worker},
 };
+use flume::TryRecvError;
 use ipnet::IpNet;
-use log::error;
+use log::{debug, error};
 use pnet::{
     packet::{
         FromPacket, Packet,
         ethernet::{EtherType, EtherTypes, EthernetPacket, MutableEthernetPacket},
         ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
         ipv4::{self, Ipv4Flags, Ipv4Packet, MutableIpv4Packet},
-        ipv6::Ipv6Packet,
+        ipv6::{Ipv6Packet, MutableIpv6Packet},
         tcp::{self, MutableTcpPacket, TcpFlags, TcpPacket},
     },
     util::MacAddr,
@@ -20,14 +21,14 @@ use rayon::ThreadPool;
 use scopeguard::defer;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
+    iter,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::{select, time};
 
 const CLOSED: u8 = TcpFlags::ACK | TcpFlags::RST;
 const OPENED: u8 = TcpFlags::ACK | TcpFlags::SYN;
@@ -40,11 +41,11 @@ pub struct Scanner<'a> {
     pub src_ip: IpAddr,
     pub src_port: u16,
     pub timeout: Duration,
-    pub recv_progress_tx: Option<flume::Sender<(u8, u16)>>,
+    pub recv_progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
     pub send_progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scanned {
     pub opened: Vec<u16>,
     pub closed: Vec<u16>,
@@ -62,6 +63,17 @@ struct Sender {
     progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
 
+struct Receiver {
+    dest_ips: Vec<IpAddr>,
+    dest_ports: Vec<u16>,
+    state: Arc<AtomicState>,
+    state_changed_on: Arc<AtomicU64>,
+    time: Instant,
+    timeout: Duration,
+    progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
+    result_tx: flume::Sender<Result<HashMap<IpAddr, Scanned>>>,
+}
+
 impl<'a> Scanner<'a> {
     pub fn build_bpf(&self) -> Result<String> {
         let dest_nets_filter = self
@@ -71,24 +83,27 @@ impl<'a> Scanner<'a> {
             .collect::<Vec<_>>()
             .join(" or ");
 
-        Ok(format!(
-            r"({}) and dst host {} and dst port {} and (tcp[tcpflags] & (tcp-ack | tcp-syn) != 0 or tcp[tcpflags] & (tcp-ack | tcp-rst) != 0)",
-            dest_nets_filter, self.src_ip, self.src_port
-        ))
+        Ok(match self.src_ip {
+            IpAddr::V4(_) => format!(
+                r"({}) and dst host {} and dst port {} and (tcp[tcpflags] & tcp-ack != 0)",
+                dest_nets_filter, self.src_ip, self.src_port
+            ),
+            IpAddr::V6(_) => format!(
+                r"({}) and dst host {} and dst port {}",
+                dest_nets_filter, self.src_ip, self.src_port
+            ),
+        })
     }
 
     pub async fn run(&self) -> Result<HashMap<IpAddr, Scanned>> {
         let interface = Interface::by_index(self.if_index)?;
         let (send_tx, send_rx) = flume::unbounded::<Vec<u8>>();
         let (recv_tx, recv_rx) = flume::unbounded::<Vec<u8>>();
-        let (break_handle, state) = Worker::new(
-            self.pool,
-            interface.to_pcap()?,
-            recv_tx,
-            send_rx,
-            self.build_bpf()?,
-        )
-        .spawn()?;
+        let (result_tx, result_rx) = flume::unbounded::<Result<HashMap<IpAddr, Scanned>>>();
+        let bpf = self.build_bpf()?;
+        debug!("bpf filter: {}", bpf);
+        let (break_handle, state, state_changed_on, time) =
+            Worker::new(self.pool, interface.to_pcap()?, recv_tx, send_rx, bpf).spawn()?;
         let dest_ips = self
             .dest_nets
             .iter()
@@ -104,6 +119,16 @@ impl<'a> Scanner<'a> {
             ttl: 64,
             progress_tx: self.send_progress_tx.clone(),
         };
+        let receiver = Receiver {
+            dest_ips: dest_ips.clone(),
+            dest_ports: self.dest_ports.clone(),
+            state: state.clone(),
+            state_changed_on: state_changed_on.clone(),
+            time,
+            timeout: self.timeout,
+            progress_tx: self.recv_progress_tx.clone(),
+            result_tx,
+        };
 
         defer! {
             break_handle.breakloop();
@@ -114,21 +139,23 @@ impl<'a> Scanner<'a> {
                 error!("failed to send packet data: {}", e)
             }
         });
-        self.recv(
-            recv_rx,
-            self.recv_progress_tx.clone(),
-            &dest_ips,
-            state.clone(),
-        )
-        .await
+        self.pool.spawn(move || {
+            if let Err(e) = Self::recv(recv_rx, receiver) {
+                error!("failed to recv packet data: {}", e)
+            }
+        });
+        result_rx
+            .into_recv_async()
+            .await
+            .map_err(|_| Error::ResultRecvFailed)?
     }
 
     fn send(send_tx: flume::Sender<Vec<u8>>, sender: Sender) -> Result<()> {
         let mut buffer = vec![0u8; Self::tcp_syn_packet_size(&sender)];
-        for dest_port in &sender.dest_ports {
+        for dest_port in sender.dest_ports {
             for dest_ip in &sender.dest_ips {
-                if let Some(progress_tx) = &sender.progress_tx {
-                    progress_tx.send((*dest_ip, *dest_port))?;
+                if let Some(ref progress_tx) = sender.progress_tx {
+                    progress_tx.send((*dest_ip, dest_port))?;
                 }
 
                 Self::build_ethernet(
@@ -148,7 +175,7 @@ impl<'a> Scanner<'a> {
                     sender.src_ip,
                     *dest_ip,
                     sender.src_port,
-                    *dest_port,
+                    dest_port,
                 )?;
                 match (sender.src_ip, dest_ip) {
                     (IpAddr::V4(src_ip), IpAddr::V4(dest_ip)) => Self::build_ipv4(
@@ -157,19 +184,16 @@ impl<'a> Scanner<'a> {
                         *dest_ip,
                         (20 + tcp_size) as u16,
                         sender.ttl,
-                        IpNextHeaderProtocols::Tcp,
                     ),
                     (IpAddr::V4(_), IpAddr::V6(_)) => return Err(Error::IpVersionMismatch),
                     (IpAddr::V6(_), IpAddr::V4(_)) => return Err(Error::IpVersionMismatch),
-                    // (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
-                    //     &mut buffer[14..54],
-                    //     src_ip,
-                    //     *dest_ip,
-                    //     (40 + tcp_size) as u16,
-                    //     sender.ttl,
-                    //     IpNextHeaderProtocols::Tcp,
-                    // ),
-                    (IpAddr::V6(_), IpAddr::V6(_)) => todo!(),
+                    (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
+                        &mut buffer[14..54],
+                        src_ip,
+                        *dest_ip,
+                        tcp_size as u16,
+                        sender.ttl,
+                    ),
                 }?;
                 send_tx.send(buffer.clone())?;
             }
@@ -196,7 +220,6 @@ impl<'a> Scanner<'a> {
         dest: Ipv4Addr,
         total_length: u16,
         ttl: u8,
-        next_protocol: IpNextHeaderProtocol,
     ) -> Result<usize> {
         let mut packet = MutableIpv4Packet::new(buffer).ok_or(Error::InsufficientBufferSize)?;
         packet.set_version(4);
@@ -208,24 +231,31 @@ impl<'a> Scanner<'a> {
         packet.set_flags(Ipv4Flags::DontFragment);
         // fragment offset omitted
         packet.set_ttl(ttl);
-        packet.set_next_level_protocol(next_protocol);
+        packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         packet.set_source(src);
         packet.set_destination(dest);
         packet.set_checksum(ipv4::checksum(&packet.to_immutable()));
         Ok(Ipv4Packet::packet_size(&packet.from_packet()))
     }
 
-    // fn build_ipv6(
-    //     buffer: &mut [u8],
-    //     src: Ipv6Addr,
-    //     dest: Ipv6Addr,
-    //     total_length: u16,
-    //     ttl: u8,
-    //     next_protocol: IpNextHeaderProtocol,
-    // ) -> Result<usize> {
-    //     let packet = MutableIpv6Packet::new(buffer).ok_or(Error::InsufficientBufferSize)?;
-    //     todo!()
-    // }
+    fn build_ipv6(
+        buffer: &mut [u8],
+        src: Ipv6Addr,
+        dest: Ipv6Addr,
+        payload_length: u16,
+        ttl: u8,
+    ) -> Result<usize> {
+        let mut packet = MutableIpv6Packet::new(buffer).ok_or(Error::InsufficientBufferSize)?;
+        packet.set_version(6);
+        packet.set_traffic_class(0);
+        packet.set_flow_label(0);
+        packet.set_payload_length(payload_length);
+        packet.set_next_header(IpNextHeaderProtocols::Tcp);
+        packet.set_hop_limit(ttl);
+        packet.set_source(src);
+        packet.set_destination(dest);
+        Ok(Ipv6Packet::packet_size(&packet.from_packet()))
+    }
 
     fn build_tcp(
         buffer: &mut [u8],
@@ -267,95 +297,137 @@ impl<'a> Scanner<'a> {
         size + 20
     }
 
-    async fn recv(
-        &self,
-        recv_rx: flume::Receiver<Vec<u8>>,
-        recv_progress_tx: Option<flume::Sender<(u8, u16)>>,
-        dest_ips: &[IpAddr],
-        state: Arc<AtomicU32>,
-    ) -> Result<HashMap<IpAddr, Scanned>> {
-        let mut results = dest_ips
-            .iter()
-            .map(|dest_ip| {
-                (
-                    *dest_ip,
-                    Scanned {
-                        opened: vec![],
-                        closed: vec![],
-                        unknown: self.dest_ports.clone(),
-                    },
-                )
-            })
-            .collect();
+    fn recv(recv_rx: flume::Receiver<Vec<u8>>, receiver: Receiver) -> Result<()> {
+        let result = Arc::new(RwLock::new(
+            receiver
+                .dest_ips
+                .iter()
+                .map(|dest_ip| {
+                    (
+                        *dest_ip,
+                        Scanned {
+                            opened: vec![],
+                            closed: vec![],
+                            unknown: receiver.dest_ports.clone(),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        ));
+        let progress_tx = receiver.progress_tx.clone();
+        let emit = loop {
+            match result.read() {
+                Ok(lock) => {
+                    if lock.values().all(|scanned| scanned.unknown.is_empty()) {
+                        break Ok(lock.clone());
+                    }
 
-        loop {
-            select! {
-                packet = recv_rx.recv_async() => {
-                    let packet = packet?;
-                    if let Some((flags, port)) = Self::parse_ethernet(packet, &mut results)? {
-                        if let Some(progress_tx) = recv_progress_tx.as_ref() {
-                            progress_tx.send((flags, port))?;
+                    match receiver.state.load(Ordering::Relaxed) {
+                        State::Idle => {
+                            if Duration::from_millis(
+                                Instant::now().duration_since(receiver.time).as_millis() as u64
+                                    - receiver.state_changed_on.load(Ordering::Relaxed),
+                            ) >= receiver.timeout
+                            {
+                                debug!("receiver timeout reached");
+                                break Err(Error::Timeout(lock.clone()));
+                            }
                         }
-                        if results.values().all(|result| result.unknown.is_empty()) {
-                            break Ok(results);
-                        }
+                        State::Busy => {}
+                        State::Stopped => continue,
                     }
                 }
-                _ = time::sleep(self.timeout) => if state.load(Ordering::Relaxed) == State::Idle as u32 {
-                    break Err(Error::Timeout(results));
-                }
+                Err(_) => break Err(Error::RwLockPoisoned),
             }
-        }
+
+            match recv_rx.try_recv() {
+                Ok(packet) => recv_rx
+                    .drain()
+                    .chain(iter::once(packet))
+                    .for_each(|packet| {
+                        let result = result.clone();
+                        let progress_tx = progress_tx.clone();
+                        rayon::spawn(move || {
+                            match (Self::parse_ethernet(packet, result.clone()), progress_tx) {
+                                (Ok(Some((dest_ip, flags, port))), Some(progress_tx)) => {
+                                    if let Err(e) = progress_tx.send((dest_ip, flags, port)) {
+                                        error!("failed to send progress: {}", e);
+                                    }
+                                }
+                                (Err(e), _) => error!("failed to parse packet: {}", e),
+                                _ => {}
+                            }
+                        })
+                    }),
+                Err(TryRecvError::Empty) => {}
+                Err(e) => break Err(Error::from(e)),
+            }
+        };
+
+        receiver
+            .result_tx
+            .send(emit)
+            .map_err(|_| Error::ResultSendFailed)?;
+        Ok(())
     }
 
     fn parse_ethernet(
         packet: Vec<u8>,
-        results: &mut HashMap<IpAddr, Scanned>,
-    ) -> Result<Option<(u8, u16)>> {
+        result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
+    ) -> Result<Option<(IpAddr, u8, u16)>> {
         let packet = EthernetPacket::new(&packet).ok_or(Error::InvalidPacketData)?;
 
         match packet.get_ethertype() {
             EtherTypes::Ipv4 => {
                 let packet = Ipv4Packet::new(packet.payload()).ok_or(Error::InvalidPacketData)?;
                 let src_ip = IpAddr::V4(packet.get_source());
-                Self::parse_ip_next_protocol(
-                    packet.get_next_level_protocol(),
+                Ok(Self::parse_ip_next_protocol(
                     packet.payload(),
-                    results
-                        .get_mut(&src_ip)
-                        .ok_or(Error::NoValidSourceIp(src_ip))?,
-                )
+                    packet.get_next_level_protocol(),
+                    src_ip,
+                    result,
+                )?
+                .map(|r| (src_ip, r.0, r.1)))
             }
             EtherTypes::Ipv6 => {
                 let packet = Ipv6Packet::new(packet.payload()).ok_or(Error::InvalidPacketData)?;
                 let src_ip = IpAddr::V6(packet.get_source());
-                Self::parse_ip_next_protocol(
-                    packet.get_next_header(),
+                Ok(Self::parse_ip_next_protocol(
                     packet.payload(),
-                    results
-                        .get_mut(&src_ip)
-                        .ok_or(Error::NoValidSourceIp(src_ip))?,
-                )
+                    packet.get_next_header(),
+                    src_ip,
+                    result,
+                )?
+                .map(|r| (src_ip, r.0, r.1)))
             }
             other => Err(Error::UnsupportedEtherType(other)),
         }
     }
 
     fn parse_ip_next_protocol(
-        ip_next_protocol: IpNextHeaderProtocol,
         packet: &[u8],
-        scanned: &mut Scanned,
+        ip_next_protocol: IpNextHeaderProtocol,
+        src_ip: IpAddr,
+        result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
     ) -> Result<Option<(u8, u16)>> {
         match ip_next_protocol {
-            IpNextHeaderProtocols::Tcp => Self::parse_tcp(packet, scanned),
+            IpNextHeaderProtocols::Tcp => Self::parse_tcp(packet, src_ip, result),
             other => Err(Error::UnsupportedIpNextProtocol(other)),
         }
     }
 
-    fn parse_tcp(packet: &[u8], scanned: &mut Scanned) -> Result<Option<(u8, u16)>> {
+    fn parse_tcp(
+        packet: &[u8],
+        src_ip: IpAddr,
+        result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
+    ) -> Result<Option<(u8, u16)>> {
         let packet = TcpPacket::new(packet).ok_or(Error::InvalidPacketData)?;
         let port = packet.get_source();
         let flags = packet.get_flags();
+        let mut lock = result.write().map_err(|_| Error::RwLockPoisoned)?;
+        let scanned = lock
+            .get_mut(&src_ip)
+            .ok_or(Error::NoValidSourceIp(src_ip))?;
 
         if !scanned.unknown.contains(&port) {
             return Ok(None);
@@ -367,7 +439,7 @@ impl<'a> Scanner<'a> {
             _ => return Ok(None),
         }
 
-        scanned.unknown.retain(|&p| p != port);
+        scanned.unknown.retain(|p| *p != port);
         Ok(Some((flags, port)))
     }
 }
