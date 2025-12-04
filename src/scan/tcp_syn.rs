@@ -1,12 +1,10 @@
 use crate::{
     error::{Error, Result},
     interface::Interface,
-    worker::{AtomicState, State, Worker},
+    worker::Worker,
 };
-use flume::TryRecvError;
 use ipnet::IpNet;
 use log::{debug, error};
-use num_integer::Integer;
 use pnet::{
     packet::{
         FromPacket, Packet,
@@ -22,13 +20,10 @@ use rayon::ThreadPool;
 use scopeguard::defer;
 use std::{
     collections::HashMap,
-    iter,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, RwLock},
+    thread,
+    time::Duration,
 };
 
 const CLOSED: u8 = TcpFlags::ACK | TcpFlags::RST;
@@ -41,9 +36,8 @@ pub struct Scanner<'a> {
     pub dest_ports: Vec<u16>,
     pub src_ip: IpAddr,
     pub src_port: u16,
-    pub timeout: Duration,
-    pub send_buffer_size: usize,
-    pub wait_idle: bool,
+    pub timeout: Option<Duration>,
+    pub wait: Option<Duration>,
     pub recv_progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
     pub send_progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
@@ -63,18 +57,13 @@ struct Sender {
     src_mac: MacAddr,
     gateway_mac: MacAddr,
     ttl: u8,
-    state: Arc<AtomicState>,
-    wait_idle: bool,
+    wait: Option<Duration>,
     progress_tx: Option<flume::Sender<(IpAddr, u16)>>,
 }
 
 struct Receiver {
     dest_ips: Vec<IpAddr>,
     dest_ports: Vec<u16>,
-    state: Arc<AtomicState>,
-    state_changed_on: Arc<AtomicU64>,
-    time: Instant,
-    timeout: Duration,
     progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
     result_tx: flume::Sender<Result<HashMap<IpAddr, Scanned>>>,
 }
@@ -102,18 +91,15 @@ impl<'a> Scanner<'a> {
 
     pub async fn run(&self) -> Result<HashMap<IpAddr, Scanned>> {
         let interface = Interface::by_index(self.if_index)?;
-        let (send_tx, send_rx) = flume::bounded::<Vec<u8>>(self.send_buffer_size);
-        let (recv_tx, recv_rx) = flume::unbounded::<Vec<u8>>();
         let (result_tx, result_rx) = flume::unbounded::<Result<HashMap<IpAddr, Scanned>>>();
-        let bpf = self.build_bpf()?;
-        debug!("bpf filter: {}", bpf);
-        let (break_handle, state, state_changed_on, time) =
-            Worker::new(self.pool, interface.to_pcap()?, recv_tx, send_rx, bpf).spawn()?;
         let dest_ips = self
             .dest_nets
             .iter()
             .flat_map(|ip| ip.hosts())
             .collect::<Vec<IpAddr>>();
+        let bpf = self.build_bpf()?;
+        debug!("bpf filter: {}", bpf);
+
         let sender = Sender {
             dest_ips: dest_ips.clone(),
             dest_ports: self.dest_ports.clone(),
@@ -122,36 +108,40 @@ impl<'a> Scanner<'a> {
             src_mac: MacAddr::from(interface.mac.ok_or(Error::NoSourceMacAvailable)?),
             gateway_mac: MacAddr::from(interface.gateway_mac.ok_or(Error::NoGatewayMacAvailable)?),
             ttl: 64,
-            state: state.clone(),
-            wait_idle: self.wait_idle,
+            wait: self.wait,
             progress_tx: self.send_progress_tx.clone(),
         };
         let receiver = Receiver {
             dest_ips: dest_ips.clone(),
             dest_ports: self.dest_ports.clone(),
-            state: state.clone(),
-            state_changed_on: state_changed_on.clone(),
-            time,
-            timeout: self.timeout,
             progress_tx: self.recv_progress_tx.clone(),
             result_tx,
         };
+        let ((tx, tx_handle), (rx, rx_handle)) =
+            Worker::new(self.pool, interface.to_pcap()?, bpf, self.timeout).spawn()?;
 
+        let tx_guard = tx.clone();
+        let rx_guard = rx.clone();
         defer! {
-            break_handle.breakloop();
+            if !tx_guard.is_disconnected() {
+                tx_handle.breakloop()
+            }
+            if !rx_guard.is_disconnected() {
+                rx_handle.breakloop()
+            }
         }
 
         self.pool.spawn(move || {
             debug!("sender started");
-            if let Err(e) = Self::send(send_tx, sender) {
+            if let Err(e) = Self::send(tx, sender) {
                 error!("failed to send packet data to capture: {}", e)
             }
             debug!("sender stopped");
         });
         self.pool.spawn(move || {
             debug!("receiver started");
-            if let Err(e) = Self::recv(recv_rx, receiver) {
-                error!("recv task failed: {}", e)
+            if let Err(e) = Self::recv(rx, receiver) {
+                error!("failed to recv packet data from capture: {}", e)
             }
             debug!("receiver stopped");
         });
@@ -161,81 +151,63 @@ impl<'a> Scanner<'a> {
             .map_err(|_| Error::ResultRecvFailed)?
     }
 
-    fn send(send_tx: flume::Sender<Vec<u8>>, sender: Sender) -> Result<()> {
+    fn send(tx: flume::Sender<Vec<u8>>, sender: Sender) -> Result<()> {
         let mut buffer = vec![0u8; Self::tcp_syn_packet_size(&sender)];
-        let mut index = 0usize;
-        let total = sender.dest_ips.len() * sender.dest_ports.len();
+        for dest_port in sender.dest_ports {
+            for &dest_ip in &sender.dest_ips {
+                if tx.is_disconnected() {
+                    return Err(Error::WorkerAborted);
+                }
 
-        // wait until receiver is started
-        while sender.state.load(Ordering::Acquire) == State::Stopped {
-            rayon::yield_now();
-        }
+                if let Some(wait) = sender.wait {
+                    thread::sleep(wait);
+                }
 
-        loop {
-            if index >= total {
-                break Ok(());
-            }
-
-            match sender.state.load(Ordering::Acquire) {
-                State::Stopped => break Err(Error::WorkerAborted),
-                State::Busy if sender.wait_idle => continue,
-                _ => {}
-            }
-
-            let (port_index, ip_index) = index.div_rem(&sender.dest_ips.len());
-            index += 1;
-            let dest_ip = *sender
-                .dest_ips
-                .get(ip_index)
-                .ok_or(Error::DestinationIpsExhausted)?;
-            let dest_port = *sender
-                .dest_ports
-                .get(port_index)
-                .ok_or(Error::DestinationPortsExhausted)?;
-
-            if let Some(ref progress_tx) = sender.progress_tx {
-                let _ = progress_tx.send((dest_ip, dest_port));
-            }
-
-            Self::build_ethernet(
-                &mut buffer[..14],
-                sender.src_mac,
-                sender.gateway_mac,
-                match sender.src_ip {
-                    IpAddr::V4(_) => EtherTypes::Ipv4,
-                    IpAddr::V6(_) => EtherTypes::Ipv6,
-                },
-            )?;
-            let tcp_size = Self::build_tcp(
-                &mut buffer[match sender.src_ip {
-                    IpAddr::V4(_) => 34,
-                    IpAddr::V6(_) => 54,
-                }..],
-                sender.src_ip,
-                dest_ip,
-                sender.src_port,
-                dest_port,
-            )?;
-            match (sender.src_ip, dest_ip) {
-                (IpAddr::V4(src_ip), IpAddr::V4(dest_ip)) => Self::build_ipv4(
-                    &mut buffer[14..34],
-                    src_ip,
+                Self::build_ethernet(
+                    &mut buffer[..14],
+                    sender.src_mac,
+                    sender.gateway_mac,
+                    match sender.src_ip {
+                        IpAddr::V4(_) => EtherTypes::Ipv4,
+                        IpAddr::V6(_) => EtherTypes::Ipv6,
+                    },
+                )?;
+                let tcp_size = Self::build_tcp(
+                    &mut buffer[match sender.src_ip {
+                        IpAddr::V4(_) => 34,
+                        IpAddr::V6(_) => 54,
+                    }..],
+                    sender.src_ip,
                     dest_ip,
-                    (20 + tcp_size) as u16,
-                    sender.ttl,
-                ),
-                (IpAddr::V4(_), IpAddr::V6(_)) => return Err(Error::IpVersionMismatch),
-                (IpAddr::V6(_), IpAddr::V4(_)) => return Err(Error::IpVersionMismatch),
-                (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
-                    &mut buffer[14..54],
-                    src_ip,
-                    dest_ip,
-                    tcp_size as u16,
-                    sender.ttl,
-                ),
-            }?;
-            send_tx.send(buffer.clone())?;
+                    sender.src_port,
+                    dest_port,
+                )?;
+                match (sender.src_ip, dest_ip) {
+                    (IpAddr::V4(src_ip), IpAddr::V4(dest_ip)) => Self::build_ipv4(
+                        &mut buffer[14..34],
+                        src_ip,
+                        dest_ip,
+                        (20 + tcp_size) as u16,
+                        sender.ttl,
+                    ),
+                    (IpAddr::V4(_), IpAddr::V6(_)) => return Err(Error::IpVersionMismatch),
+                    (IpAddr::V6(_), IpAddr::V4(_)) => return Err(Error::IpVersionMismatch),
+                    (IpAddr::V6(src_ip), IpAddr::V6(dest_ip)) => Self::build_ipv6(
+                        &mut buffer[14..54],
+                        src_ip,
+                        dest_ip,
+                        tcp_size as u16,
+                        sender.ttl,
+                    ),
+                }?;
+                tx.send(buffer.clone())?;
+
+                if let Some(ref progress_tx) = sender.progress_tx {
+                    progress_tx.send((dest_ip, dest_port))?;
+                }
+            }
         }
+        Ok(())
     }
 
     fn build_ethernet(
@@ -334,7 +306,7 @@ impl<'a> Scanner<'a> {
         size + 20
     }
 
-    fn recv(recv_rx: flume::Receiver<Vec<u8>>, receiver: Receiver) -> Result<()> {
+    fn recv(rx: flume::Receiver<Vec<u8>>, receiver: Receiver) -> Result<()> {
         let result = Arc::new(RwLock::new(
             receiver
                 .dest_ips
@@ -351,61 +323,23 @@ impl<'a> Scanner<'a> {
                 })
                 .collect::<HashMap<_, _>>(),
         ));
-        let progress_tx = receiver.progress_tx.clone();
 
-        // wait until receiver is started
-        while receiver.state.load(Ordering::Acquire) == State::Stopped {
-            rayon::yield_now();
-        }
-
-        let emit = loop {
-            match result.read() {
-                Ok(lock) => {
-                    if lock.values().all(|scanned| scanned.unknown.is_empty()) {
-                        break Ok(lock.clone());
-                    }
-
-                    match receiver.state.load(Ordering::Acquire) {
-                        State::Idle => {
-                            if Duration::from_millis(
-                                Instant::now().duration_since(receiver.time).as_millis() as u64
-                                    - receiver.state_changed_on.load(Ordering::Acquire),
-                            ) >= receiver.timeout
-                            {
-                                break Err(Error::Timeout(lock.clone()));
-                            }
-                        }
-                        State::Busy => {}
-                        State::Stopped => break Err(Error::WorkerAbortedWith(lock.clone())),
-                    }
+        while let Ok(packet) = rx.recv() {
+            let progress_tx = receiver.progress_tx.clone();
+            let result_tx = receiver.result_tx.clone();
+            let result = result.clone();
+            rayon::spawn(move || {
+                if let Err(e) = Self::parse_ethernet(packet, result, result_tx, progress_tx) {
+                    error!("failed to parse received packet: {}", e);
                 }
-                Err(_) => break Err(Error::RwLockPoisoned),
-            }
-
-            match recv_rx.try_recv() {
-                Ok(packet) => recv_rx
-                    .drain()
-                    .chain(iter::once(packet))
-                    .for_each(|packet| {
-                        let result = result.clone();
-                        let progress_tx = progress_tx.clone();
-                        rayon::spawn(move || {
-                            match (Self::parse_ethernet(packet, result.clone()), progress_tx) {
-                                (Ok(Some((dest_ip, flags, port))), Some(progress_tx)) => {
-                                    let _ = progress_tx.send((dest_ip, flags, port));
-                                }
-                                (Err(e), _) => error!("failed to parse packet: {}", e),
-                                _ => {}
-                            }
-                        })
-                    }),
-                _ => {}
-            }
-        };
+            })
+        }
 
         receiver
             .result_tx
-            .send(emit)
+            .send(Err(Error::WorkerAbortedWith(
+                result.read().map_err(|_| Error::RwLockPoisoned)?.clone(),
+            )))
             .map_err(|_| Error::ResultSendFailed)?;
         Ok(())
     }
@@ -413,31 +347,35 @@ impl<'a> Scanner<'a> {
     fn parse_ethernet(
         packet: Vec<u8>,
         result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
-    ) -> Result<Option<(IpAddr, u8, u16)>> {
+        result_tx: flume::Sender<Result<HashMap<IpAddr, Scanned>>>,
+        progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
+    ) -> Result<()> {
         let packet = EthernetPacket::new(&packet).ok_or(Error::InvalidPacketData)?;
 
         match packet.get_ethertype() {
             EtherTypes::Ipv4 => {
                 let packet = Ipv4Packet::new(packet.payload()).ok_or(Error::InvalidPacketData)?;
                 let src_ip = IpAddr::V4(packet.get_source());
-                Ok(Self::parse_ip_next_protocol(
+                Self::parse_ip_next_protocol(
                     packet.payload(),
                     packet.get_next_level_protocol(),
                     src_ip,
                     result,
-                )?
-                .map(|r| (src_ip, r.0, r.1)))
+                    result_tx,
+                    progress_tx,
+                )
             }
             EtherTypes::Ipv6 => {
                 let packet = Ipv6Packet::new(packet.payload()).ok_or(Error::InvalidPacketData)?;
                 let src_ip = IpAddr::V6(packet.get_source());
-                Ok(Self::parse_ip_next_protocol(
+                Self::parse_ip_next_protocol(
                     packet.payload(),
                     packet.get_next_header(),
                     src_ip,
                     result,
-                )?
-                .map(|r| (src_ip, r.0, r.1)))
+                    result_tx,
+                    progress_tx,
+                )
             }
             other => Err(Error::UnsupportedEtherType(other)),
         }
@@ -448,9 +386,13 @@ impl<'a> Scanner<'a> {
         ip_next_protocol: IpNextHeaderProtocol,
         src_ip: IpAddr,
         result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
-    ) -> Result<Option<(u8, u16)>> {
+        result_tx: flume::Sender<Result<HashMap<IpAddr, Scanned>>>,
+        progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
+    ) -> Result<()> {
         match ip_next_protocol {
-            IpNextHeaderProtocols::Tcp => Self::parse_tcp(packet, src_ip, result),
+            IpNextHeaderProtocols::Tcp => {
+                Self::parse_tcp(packet, src_ip, result, result_tx, progress_tx)
+            }
             other => Err(Error::UnsupportedIpNextProtocol(other)),
         }
     }
@@ -459,7 +401,9 @@ impl<'a> Scanner<'a> {
         packet: &[u8],
         src_ip: IpAddr,
         result: Arc<RwLock<HashMap<IpAddr, Scanned>>>,
-    ) -> Result<Option<(u8, u16)>> {
+        result_tx: flume::Sender<Result<HashMap<IpAddr, Scanned>>>,
+        progress_tx: Option<flume::Sender<(IpAddr, u8, u16)>>,
+    ) -> Result<()> {
         let packet = TcpPacket::new(packet).ok_or(Error::InvalidPacketData)?;
         let port = packet.get_source();
         let flags = packet.get_flags();
@@ -469,16 +413,27 @@ impl<'a> Scanner<'a> {
             .ok_or(Error::NoValidSourceIp(src_ip))?;
 
         if !scanned.unknown.contains(&port) {
-            return Ok(None);
+            return Ok(());
         }
 
         match flags {
             CLOSED => scanned.closed.push(port),
             OPENED => scanned.opened.push(port),
-            _ => return Ok(None),
+            _ => return Ok(()),
         }
 
         scanned.unknown.retain(|p| *p != port);
-        Ok(Some((flags, port)))
+
+        if let Some(progress_tx) = progress_tx {
+            progress_tx.send((src_ip, flags, port))?;
+        }
+
+        if lock.values().all(|scanned| scanned.unknown.is_empty()) {
+            debug!("all destination ports scanned, sending result");
+            result_tx
+                .send(Ok(lock.clone()))
+                .map_err(|_| Error::ResultSendFailed)?;
+        }
+        Ok(())
     }
 }

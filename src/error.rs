@@ -25,6 +25,9 @@ pub enum Error {
     #[error("flume try recv failed: {0}")]
     FlumeTryRecvFailed(#[from] flume::TryRecvError),
 
+    #[error("flume recv failed: {0}")]
+    FlumeRecvFailed(#[from] flume::RecvError),
+
     #[error("insufficient buffer size")]
     InsufficientBufferSize,
 

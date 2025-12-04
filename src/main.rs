@@ -65,7 +65,9 @@ async fn list_interfaces() -> Result<()> {
 }
 
 async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
-    let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
+    if arg.rate <= arg.timeout {
+        bail!("rate must be greater than timeout");
+    }
 
     let dest_ips = arg
         .dest_nets
@@ -101,6 +103,7 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
     );
 
     let (progress, progress_tx) = Progress::new(count);
+    let pool = ThreadPoolBuilder::new().num_threads(arg.thread).build()?;
 
     let scanner = tcp_syn::Scanner {
         pool: &pool,
@@ -109,11 +112,10 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
         dest_ports: arg.dest_ports,
         src_ip,
         src_port: rand::random(),
-        timeout: Duration::from_secs(2),
-        wait_idle: arg.wait_idle,
-        send_buffer_size: arg.send_buffer_size,
-        send_progress_tx: None,
-        recv_progress_tx: Some(progress_tx),
+        timeout: Some(Duration::from_secs(arg.timeout)),
+        wait: Some(Duration::from_secs_f64(1.0 / arg.rate as f64)),
+        send_progress_tx: Some(progress_tx),
+        recv_progress_tx: None,
     };
 
     tokio::spawn(progress.run());
@@ -125,8 +127,10 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
                 .filter(|(_, result)| !result.opened.is_empty())
             {
                 info!(
-                    "{}: opened: {:?}, unknown: {:?}",
-                    ip, result.opened, result.unknown
+                    "{}: opened: {:?}, number of unknown: {}",
+                    ip,
+                    result.opened,
+                    result.unknown.len()
                 );
             }
         }
@@ -137,8 +141,10 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
                 .filter(|(_, result)| !result.opened.is_empty())
             {
                 info!(
-                    "{}: opened: {:?}, unknown: {:?}",
-                    ip, result.opened, result.unknown
+                    "{}: opened: {:?}, number of unknown: {}",
+                    ip,
+                    result.opened,
+                    result.unknown.len()
                 );
             }
         }
@@ -149,8 +155,10 @@ async fn tcp_syn(arg: TcpSynArg) -> Result<()> {
                 .filter(|(_, result)| !result.opened.is_empty())
             {
                 info!(
-                    "{}: opened: {:?}, unknown: {:?}",
-                    ip, result.opened, result.unknown
+                    "{}: opened: {:?}, number of unknown: {}",
+                    ip,
+                    result.opened,
+                    result.unknown.len()
                 );
             }
         }
